@@ -625,7 +625,7 @@ pub use context::Func;
 pub struct FuncDecl {
     pub attrs: AttrSet,
 
-    pub ret_type: Type,
+    pub ret_types: SmallVec<[Type; 2]>,
 
     pub params: SmallVec<[FuncParam; 2]>,
 
@@ -891,7 +891,19 @@ pub use context::DataInstForm;
 pub struct DataInstFormDef {
     pub kind: DataInstKind,
 
-    pub output_type: Option<Type>,
+    /// Types for all the outputs of instructions with this "form".
+    ///
+    /// That is, `output_types[i]` is the type of the [`Value::DataInstOutput`]
+    /// with `output_idx == i` (see also [`Value`] documentation).
+    ///
+    /// Most instructions have `0` or `1` outputs, with these notable exceptions:
+    /// * calls which return multiple values
+    /// * SPIR-V instructions which originally produced SPIR-V "aggregates"
+    ///   (`OpTypeStruct`/`OpTypeArray`) before [`spv::lower`] decomposed them
+    ///   * in the general case, [`spv::InstLowering`] tracks original types
+    //
+    // FIXME(eddyb) change the inline size of this to fit most instructions.
+    pub output_types: SmallVec<[Type; 2]>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -903,13 +915,40 @@ pub enum DataInstKind {
     /// `QPtr`-specific operations (see [`qptr::QPtrOp`]).
     QPtr(qptr::QPtrOp),
 
-    SpvInst(spv::Inst),
+    SpvInst(spv::Inst, spv::InstLowering),
     SpvExtInst {
         ext_set: InternedStr,
         inst: u32,
+        lowering: spv::InstLowering,
     },
 }
 
+/// Use of a value, either constant or defined earlier in the same function.
+///
+/// Each `Value` can only have one of these types:
+/// * scalars (`bool`, integers, floating-point numbers)
+///   * pointers not included here to match SPIR-V (unlike other IRs)
+/// * vectors (small array of scalars)
+///   * these are *not* traditional SIMD vectors, but more a form of "compression"
+///     (i.e. vector ops often applying the equivalent scalar op per-component),
+///     and sometimes also mandated by specs (e.g. some Vulkan `BuiltIn` types)
+/// * matrices (small array of vectors)
+///   * less fundamental than vectors, may be treated like arrays in the future
+/// * pointers and by-value (but still opaque) resource handles
+///   * SPIR-V has both opaque resource handles that behave much like pointers,
+///     even physical ones (e.g. ray-tracing `OpTypeAccelerationStructureKHR`s),
+///     and others that are only loaded from memory just before using them as
+///     operands (e.g. images/samplers), and such mismatches in indirection may
+///     result in SPIR-T making further distinctions here in the future
+///
+/// Notably, "aggregate" types (SPIR-V `OpTypeStruct`/`OpTypeArray`) are excluded,
+/// so they have to be (recursively) disaggregated into their constituents, and
+/// passed around as separate `Value`s (see also [`DataInstFormDef`] docs).
+/// * SPIR-V inherited "by-value aggregates" from LLVM, which supports them under
+///   the name "FCA" ("first-class aggregates"), but other IRs (and LLVM passes)
+///   avoid them because of their (negative) impact on analyses and transforms,
+///   with their main vestigial purpose being to encode multiple return values
+///   from functions, which can be done more directly in other IRs (and SPIR-T)
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Value {
     Const(Const),
@@ -933,6 +972,10 @@ pub enum Value {
         output_idx: u32,
     },
 
-    /// The output value of a [`DataInst`].
-    DataInstOutput(DataInst),
+    /// One of the outputs produced by a [`DataInst`], with its type given by
+    /// `cx[data_insts[inst].form].output_types[output_idx]`.
+    DataInstOutput {
+        inst: DataInst,
+        output_idx: u32,
+    },
 }

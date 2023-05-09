@@ -445,7 +445,11 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         // FIXME(eddyb) maybe all this data should be packaged up together in a
         // type with fields like those of `DeferredPtrNoop` (or even more).
         let type_of_val_as_spv_ptr_with_layout = |v: Value| {
-            if let Value::DataInstOutput(v_data_inst) = v {
+            if let Value::DataInstOutput {
+                inst: v_data_inst,
+                output_idx: 0,
+            } = v
+            {
                 if let Some(ptr_noop) = self.deferred_ptr_noops.get(&v_data_inst) {
                     return Ok((
                         ptr_noop.output_pointer_addr_space,
@@ -481,18 +485,20 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 DataInstDef {
                     attrs: self.lifter.strip_qptr_usage_attr(data_inst_def.attrs),
                     form: cx.intern(DataInstFormDef {
-                        kind: DataInstKind::SpvInst(spv::Inst {
-                            opcode: wk.OpVariable,
-                            imms: [spv::Imm::Short(wk.StorageClass, wk.Function)]
-                                .into_iter()
-                                .collect(),
-                        }),
-                        output_type: Some(
-                            self.lifter.spv_ptr_type(
-                                AddrSpace::SpvStorageClass(wk.Function),
-                                pointee_type,
-                            ),
+                        kind: DataInstKind::SpvInst(
+                            spv::Inst {
+                                opcode: wk.OpVariable,
+                                imms: [spv::Imm::Short(wk.StorageClass, wk.Function)]
+                                    .into_iter()
+                                    .collect(),
+                            },
+                            spv::InstLowering::default(),
                         ),
+                        output_types: [self
+                            .lifter
+                            .spv_ptr_type(AddrSpace::SpvStorageClass(wk.Function), pointee_type)]
+                        .into_iter()
+                        .collect(),
                     }),
                     inputs: data_inst_def.inputs.clone(),
                 }
@@ -519,8 +525,13 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 DataInstDef {
                     attrs: data_inst_def.attrs,
                     form: cx.intern(DataInstFormDef {
-                        kind: DataInstKind::SpvInst(wk.OpAccessChain.into()),
-                        output_type: Some(self.lifter.spv_ptr_type(addr_space, handle_type)),
+                        kind: DataInstKind::SpvInst(
+                            wk.OpAccessChain.into(),
+                            spv::InstLowering::default(),
+                        ),
+                        output_types: [self.lifter.spv_ptr_type(addr_space, handle_type)]
+                            .into_iter()
+                            .collect(),
                     }),
                     inputs: data_inst_def.inputs.clone(),
                 }
@@ -550,7 +561,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     // maybe don't even replace the `QPtrOp::Buffer` instruction?
                     form: cx.intern(DataInstFormDef {
                         kind: QPtrOp::BufferData.into(),
-                        output_type: Some(type_of_val(buf_ptr)),
+                        output_types: [type_of_val(buf_ptr)].into_iter().collect(),
                     }),
                     ..data_inst_def.clone()
                 }
@@ -595,13 +606,16 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
                 DataInstDef {
                     form: cx.intern(DataInstFormDef {
-                        kind: DataInstKind::SpvInst(spv::Inst {
-                            opcode: wk.OpArrayLength,
-                            imms: [spv::Imm::Short(wk.LiteralInteger, field_idx)]
-                                .into_iter()
-                                .collect(),
-                        }),
-                        output_type: data_inst_form_def.output_type,
+                        kind: DataInstKind::SpvInst(
+                            spv::Inst {
+                                opcode: wk.OpArrayLength,
+                                imms: [spv::Imm::Short(wk.LiteralInteger, field_idx)]
+                                    .into_iter()
+                                    .collect(),
+                            },
+                            spv::InstLowering::default(),
+                        ),
+                        output_types: data_inst_form_def.output_types.clone(),
                     }),
                     ..data_inst_def.clone()
                 }
@@ -696,7 +710,7 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                         // maybe don't even replace the `QPtrOp::Offset` instruction?
                         form: cx.intern(DataInstFormDef {
                             kind: QPtrOp::Offset(0).into(),
-                            output_type: Some(type_of_val(base_ptr)),
+                            output_types: [type_of_val(base_ptr)].into_iter().collect(),
                         }),
                         ..data_inst_def.clone()
                     }
@@ -704,10 +718,15 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                     DataInstDef {
                         attrs: data_inst_def.attrs,
                         form: cx.intern(DataInstFormDef {
-                            kind: DataInstKind::SpvInst(wk.OpAccessChain.into()),
-                            output_type: Some(
-                                self.lifter.spv_ptr_type(addr_space, layout.original_type),
+                            kind: DataInstKind::SpvInst(
+                                wk.OpAccessChain.into(),
+                                spv::InstLowering::default(),
                             ),
+                            output_types: [self
+                                .lifter
+                                .spv_ptr_type(addr_space, layout.original_type)]
+                            .into_iter()
+                            .collect(),
                         }),
                         inputs: access_chain_inputs,
                     }
@@ -796,17 +815,20 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                 DataInstDef {
                     attrs: data_inst_def.attrs,
                     form: cx.intern(DataInstFormDef {
-                        kind: DataInstKind::SpvInst(wk.OpAccessChain.into()),
-                        output_type: Some(
-                            self.lifter.spv_ptr_type(addr_space, layout.original_type),
+                        kind: DataInstKind::SpvInst(
+                            wk.OpAccessChain.into(),
+                            spv::InstLowering::default(),
                         ),
+                        output_types: [self.lifter.spv_ptr_type(addr_space, layout.original_type)]
+                            .into_iter()
+                            .collect(),
                     }),
                     inputs: access_chain_inputs,
                 }
             }
             DataInstKind::QPtr(op @ (QPtrOp::Load | QPtrOp::Store)) => {
                 let (spv_opcode, access_type) = match op {
-                    QPtrOp::Load => (wk.OpLoad, data_inst_form_def.output_type.unwrap()),
+                    QPtrOp::Load => (wk.OpLoad, data_inst_form_def.output_types[0]),
                     QPtrOp::Store => (wk.OpStore, type_of_val(data_inst_def.inputs[1])),
                     _ => unreachable!(),
                 };
@@ -828,8 +850,11 @@ impl LiftToSpvPtrInstsInFunc<'_> {
 
                 let mut new_data_inst_def = DataInstDef {
                     form: cx.intern(DataInstFormDef {
-                        kind: DataInstKind::SpvInst(spv_opcode.into()),
-                        output_type: data_inst_form_def.output_type,
+                        kind: DataInstKind::SpvInst(
+                            spv_opcode.into(),
+                            spv::InstLowering::default(),
+                        ),
+                        output_types: data_inst_form_def.output_types.clone(),
                     }),
                     ..data_inst_def.clone()
                 };
@@ -860,14 +885,16 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                         _ => unreachable!(),
                     }
 
-                    new_data_inst_def.inputs[input_idx] =
-                        Value::DataInstOutput(access_chain_data_inst);
+                    new_data_inst_def.inputs[input_idx] = Value::DataInstOutput {
+                        inst: access_chain_data_inst,
+                        output_idx: 0,
+                    };
                 }
 
                 new_data_inst_def
             }
 
-            DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {
+            DataInstKind::SpvInst(_, lowering) | DataInstKind::SpvExtInst { lowering, .. } => {
                 let mut to_spv_ptr_input_adjustments = vec![];
                 let mut from_spv_ptr_output = None;
                 for attr in &cx[data_inst_def.attrs].attrs {
@@ -938,14 +965,22 @@ impl LiftToSpvPtrInstsInFunc<'_> {
                         _ => unreachable!(),
                     }
 
-                    new_data_inst_def.inputs[input_idx] =
-                        Value::DataInstOutput(access_chain_data_inst);
+                    new_data_inst_def.inputs[input_idx] = Value::DataInstOutput {
+                        inst: access_chain_data_inst,
+                        output_idx: 0,
+                    };
                 }
 
                 if let Some((addr_space, pointee_type)) = from_spv_ptr_output {
+                    assert!(lowering.disaggregated_output.is_none());
+
+                    let data_inst_form_def = &cx[new_data_inst_def.form];
+                    assert_eq!(data_inst_form_def.output_types.len(), 1);
                     new_data_inst_def.form = cx.intern(DataInstFormDef {
-                        output_type: Some(self.lifter.spv_ptr_type(addr_space, pointee_type)),
-                        ..cx[new_data_inst_def.form].clone()
+                        output_types: [self.lifter.spv_ptr_type(addr_space, pointee_type)]
+                            .into_iter()
+                            .collect(),
+                        ..data_inst_form_def.clone()
                     });
                 }
 
@@ -1069,8 +1104,13 @@ impl LiftToSpvPtrInstsInFunc<'_> {
             Some(DataInstDef {
                 attrs: Default::default(),
                 form: self.lifter.cx.intern(DataInstFormDef {
-                    kind: DataInstKind::SpvInst(wk.OpAccessChain.into()),
-                    output_type: Some(self.lifter.spv_ptr_type(addr_space, access_type)),
+                    kind: DataInstKind::SpvInst(
+                        wk.OpAccessChain.into(),
+                        spv::InstLowering::default(),
+                    ),
+                    output_types: [self.lifter.spv_ptr_type(addr_space, access_type)]
+                        .into_iter()
+                        .collect(),
                 }),
                 inputs: access_chain_inputs,
             })
@@ -1088,8 +1128,12 @@ impl LiftToSpvPtrInstsInFunc<'_> {
         for v in values {
             // FIXME(eddyb) the loop could theoretically be avoided, but that'd
             // make tracking use counts harder.
-            while let Value::DataInstOutput(data_inst) = *v {
-                match self.deferred_ptr_noops.get(&data_inst) {
+            while let Value::DataInstOutput {
+                inst,
+                output_idx: 0,
+            } = *v
+            {
+                match self.deferred_ptr_noops.get(&inst) {
                     Some(ptr_noop) => {
                         *v = ptr_noop.output_pointer;
                     }
@@ -1103,8 +1147,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
     // encoded as `Option<NonZeroU32>` for (dense) map entry reasons.
     fn add_value_uses(&mut self, values: &[Value]) {
         for &v in values {
-            if let Value::DataInstOutput(data_inst) = v {
-                let count = self.data_inst_use_counts.entry(data_inst);
+            if let Value::DataInstOutput { inst, .. } = v {
+                let count = self.data_inst_use_counts.entry(inst);
                 *count = Some(
                     NonZeroU32::new(count.map_or(0, |c| c.get()).checked_add(1).unwrap()).unwrap(),
                 );
@@ -1113,8 +1157,8 @@ impl LiftToSpvPtrInstsInFunc<'_> {
     }
     fn remove_value_uses(&mut self, values: &[Value]) {
         for &v in values {
-            if let Value::DataInstOutput(data_inst) = v {
-                let count = self.data_inst_use_counts.entry(data_inst);
+            if let Value::DataInstOutput { inst, .. } = v {
+                let count = self.data_inst_use_counts.entry(inst);
                 *count = NonZeroU32::new(count.unwrap().get() - 1);
             }
         }
@@ -1173,11 +1217,14 @@ impl Transformer for LiftToSpvPtrInstsInFunc<'_> {
                         lifted = Err(LiftError(Diag::bug([
                             "unimplemented qptr instruction".into()
                         ])));
-                    } else if let Some(ty) = data_inst_form_def.output_type {
-                        if matches!(self.lifter.cx[ty].ctor, TypeCtor::QPtr) {
-                            lifted = Err(LiftError(Diag::bug([
-                                "unimplemented qptr-producing instruction".into(),
-                            ])));
+                    } else {
+                        for &ty in &data_inst_form_def.output_types {
+                            if matches!(self.lifter.cx[ty].ctor, TypeCtor::QPtr) {
+                                lifted = Err(LiftError(Diag::bug([
+                                    "unimplemented qptr-producing instruction".into(),
+                                ])));
+                                break;
+                            }
                         }
                     }
                 }

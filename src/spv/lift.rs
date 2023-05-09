@@ -6,17 +6,19 @@ use crate::visit::{InnerVisit, Visitor};
 use crate::{
     cfg, AddrSpace, Attr, AttrSet, Const, ConstCtor, ConstDef, Context, ControlNode,
     ControlNodeKind, ControlNodeOutputDecl, ControlRegion, ControlRegionInputDecl, DataInst,
-    DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, DeclDef, EntityList, ExportKey,
-    Exportee, Func, FuncDecl, FuncDefBody, FuncParam, FxIndexMap, FxIndexSet, GlobalVar,
-    GlobalVarDefBody, Import, Module, ModuleDebugInfo, ModuleDialect, SelectionKind, Type,
-    TypeCtor, TypeCtorArg, TypeDef, Value,
+    DataInstDef, DataInstForm, DataInstFormDef, DataInstKind, DeclDef, EntityList,
+    EntityOrientedDenseMap, ExportKey, Exportee, Func, FuncDecl, FuncDefBody, FuncParam,
+    FxIndexMap, FxIndexSet, GlobalVar, GlobalVarDefBody, Import, Module, ModuleDebugInfo,
+    ModuleDialect, SelectionKind, Type, TypeCtor, TypeCtorArg, TypeDef, Value,
 };
+use itertools::Itertools;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::num::NonZeroUsize;
 use std::path::Path;
+use std::rc::Rc;
 use std::{io, iter, mem, slice};
 
 impl spv::Dialect {
@@ -91,6 +93,8 @@ struct IdAllocator<'a, AI: FnMut() -> spv::Id> {
 
     data_inst_forms_seen: FxIndexSet<DataInstForm>,
     global_vars_seen: FxIndexSet<GlobalVar>,
+
+    cached_spv_aggregates: FxHashMap<Type, SpvAggregate>,
 }
 
 #[derive(Default)]
@@ -212,7 +216,22 @@ impl<AI: FnMut() -> spv::Id> Visitor<'_> for IdAllocator<'_, AI> {
 
         // Synthesize an `OpTypeFunction` type (that SPIR-T itself doesn't carry).
         let wk = &spec::Spec::get().well_known;
-        let spv_func_ret_type = func_decl.ret_type;
+        let spv_func_ret_type = match &func_decl.ret_types[..] {
+            &[ty] => ty,
+            // Reaggregate multiple return types into an `OpTypeStruct`.
+            ret_types => {
+                let opcode = if ret_types.is_empty() {
+                    wk.OpTypeVoid
+                } else {
+                    wk.OpTypeStruct
+                };
+                self.cx.intern(TypeDef {
+                    attrs: AttrSet::default(),
+                    ctor: TypeCtor::SpvInst(opcode.into()),
+                    ctor_args: ret_types.iter().copied().map(TypeCtorArg::Type).collect(),
+                })
+            }
+        };
         let spv_func_type = self.cx.intern(TypeDef {
             attrs: AttrSet::default(),
             ctor: TypeCtor::SpvInst(wk.OpTypeFunction.into()),
@@ -239,7 +258,8 @@ impl<AI: FnMut() -> spv::Id> Visitor<'_> for IdAllocator<'_, AI> {
 
         self.visit_func_decl(func_decl);
 
-        // Handle the body last, to minimize recursion hazards (see comment above).
+        // Handle the body last, to minimize recursion hazards (see comment above),
+        // and to allow `FuncBodyLifting` to look up its dependencies in `self.ids`.
         match &func_decl.def {
             DeclDef::Imported(_) => {}
             DeclDef::Present(func_def_body) => {
@@ -287,7 +307,7 @@ impl<AI: FnMut() -> spv::Id> Visitor<'_> for IdAllocator<'_, AI> {
 
             DataInstKind::FuncCall(_) => {}
 
-            DataInstKind::SpvInst(_) => {}
+            DataInstKind::SpvInst(..) => {}
             DataInstKind::SpvExtInst { ext_set, .. } => {
                 self.ids
                     .ext_inst_imports
@@ -299,12 +319,163 @@ impl<AI: FnMut() -> spv::Id> Visitor<'_> for IdAllocator<'_, AI> {
     }
 }
 
+/// Information necessary for regenerating values of some SPIR-V "aggregate" type
+/// (`OpTypeStruct`/`OpTypeArray`) from the disaggregated form in SPIR-T, and
+/// also any extractions implied by [`Value::DataInstOutput`] uses of the leaves.
+#[derive(Clone)]
+struct SpvAggregate {
+    leaves: Rc<SmallVec<[SpvAggregateLeaf; 2]>>,
+}
+
+struct SpvAggregateLeaf {
+    /// Path through the whole parent [`SpvAggregate`], to this leaf, consisting
+    /// of `OpTypeStruct` field indices and/or `OpTypeArray` element indices.
+    //
+    // NOTE(eddyb) it may seem possible to have `O(1)` leaves that indicate
+    // whether they start/end nested aggregates, but each level can have some
+    // number of ZSTs (contributing zero leaves), so this compromise is needed.
+    path: SmallVec<[u32; 4]>,
+}
+
+impl SpvAggregateLeaf {
+    fn op_composite_insert(&self) -> spv::Inst {
+        let wk = &spec::Spec::get().well_known;
+        let int_imm = |i| spv::Imm::Short(wk.LiteralInteger, i);
+        spv::Inst {
+            opcode: wk.OpCompositeInsert,
+            imms: self.path.iter().copied().map(int_imm).collect(),
+        }
+    }
+    fn op_composite_extract(&self) -> spv::Inst {
+        let wk = &spec::Spec::get().well_known;
+        let int_imm = |i| spv::Imm::Short(wk.LiteralInteger, i);
+        spv::Inst {
+            opcode: wk.OpCompositeExtract,
+            imms: self.path.iter().copied().map(int_imm).collect(),
+        }
+    }
+}
+
+impl<AI: FnMut() -> spv::Id> IdAllocator<'_, AI> {
+    fn spv_aggregate(&mut self, ty: Type) -> SpvAggregate {
+        if let Some(cached) = self.cached_spv_aggregates.get(&ty).cloned() {
+            return cached;
+        }
+        let spv_aggregate = self.unchached_try_spv_aggregate(ty).unwrap_or_else(|msg| {
+            unreachable!(
+                "spv::lift::IdAllocator::spv_aggregate: {msg}: {}",
+                // HACK(eddyb) the `DiagMsgPart` is only used because `Type`
+                // doesn't fit the pretty-printer API wrt the `AttrsAndDef` type.
+                crate::print::Plan::for_root(self.cx, &vec![crate::DiagMsgPart::Type(ty)])
+                    .pretty_print()
+            );
+        });
+        self.cached_spv_aggregates.insert(ty, spv_aggregate.clone());
+        spv_aggregate
+    }
+
+    // HACK(eddyb) this allows detecting leaves (by turning `Err` into `None`).
+    fn maybe_spv_aggregate(&mut self, ty: Type) -> Option<SpvAggregate> {
+        if let Some(cached) = self.cached_spv_aggregates.get(&ty).cloned() {
+            return Some(cached);
+        }
+        let spv_aggregate = self.unchached_try_spv_aggregate(ty).ok()?;
+        self.cached_spv_aggregates.insert(ty, spv_aggregate.clone());
+        Some(spv_aggregate)
+    }
+
+    fn unchached_try_spv_aggregate(&mut self, ty: Type) -> Result<SpvAggregate, &'static str> {
+        let wk = &spec::Spec::get().well_known;
+
+        let ty_def = &self.cx[ty];
+
+        let mut leaves = SmallVec::new();
+        match &ty_def.ctor {
+            TypeCtor::SpvInst(spv_inst) if spv_inst.opcode == wk.OpTypeStruct => {
+                for (i, &arg) in ty_def.ctor_args.iter().enumerate() {
+                    let field_type = match arg {
+                        TypeCtorArg::Type(ty) => ty,
+                        TypeCtorArg::Const(_) => {
+                            return Err("`OpTypeStruct` with invalid (non-type) operands");
+                        }
+                    };
+                    let field_path_prefix = [u32::try_from(i).unwrap()];
+                    match self.maybe_spv_aggregate(field_type) {
+                        Some(field_aggregate) => {
+                            leaves.extend(field_aggregate.leaves.iter().map(|field_leaf| {
+                                SpvAggregateLeaf {
+                                    path: field_path_prefix
+                                        .into_iter()
+                                        .chain(field_leaf.path.iter().copied())
+                                        .collect(),
+                                }
+                            }));
+                        }
+                        None => leaves.push(SpvAggregateLeaf {
+                            path: field_path_prefix.into_iter().collect(),
+                        }),
+                    }
+                }
+            }
+            TypeCtor::SpvInst(spv_inst) if spv_inst.opcode == wk.OpTypeArray => {
+                let (elem_type, len) = match ty_def.ctor_args[..] {
+                    [TypeCtorArg::Type(elem_type), TypeCtorArg::Const(len)] => (elem_type, len),
+                    _ => return Err("`OpTypeArray` with invalid operands"),
+                };
+
+                let elem_aggregate = self.maybe_spv_aggregate(elem_type);
+
+                let fixed_len = match &self.cx[len].ctor {
+                    ConstCtor::SpvInst(spv_inst)
+                        if spv_inst.opcode == wk.OpConstant && spv_inst.imms.len() == 1 =>
+                    {
+                        match spv_inst.imms[..] {
+                            [spv::Imm::Short(_, x)] => x,
+                            _ => unreachable!(),
+                        }
+                    }
+                    _ => return Err("`OpTypeArray` with specialization constant length"),
+                };
+
+                let leaf_count = elem_aggregate
+                    .as_ref()
+                    .map_or(1, |elem_aggregate| elem_aggregate.leaves.len());
+                if let Some(capacity) = leaf_count.checked_mul(fixed_len as usize) {
+                    leaves.reserve(capacity);
+                }
+
+                for i in 0..fixed_len {
+                    let elem_path_prefix = [i];
+                    match &elem_aggregate {
+                        Some(elem_aggregate) => {
+                            leaves.extend(elem_aggregate.leaves.iter().map(|elem_leaf| {
+                                SpvAggregateLeaf {
+                                    path: elem_path_prefix
+                                        .into_iter()
+                                        .chain(elem_leaf.path.iter().copied())
+                                        .collect(),
+                                }
+                            }));
+                        }
+                        None => leaves.push(SpvAggregateLeaf {
+                            path: elem_path_prefix.into_iter().collect(),
+                        }),
+                    }
+                }
+            }
+            _ => return Err("type other than `OpTypeStruct`/`OpTypeArray`"),
+        }
+
+        Ok(SpvAggregate {
+            leaves: Rc::new(leaves),
+        })
+    }
+}
+
 // FIXME(eddyb) this is inconsistently named with `FuncIds`.
 struct FuncBodyLifting<'a> {
-    // FIXME(eddyb) use `EntityOrientedDenseMap` here.
-    region_inputs_source: FxHashMap<ControlRegion, RegionInputsSource>,
-    // FIXME(eddyb) use `EntityOrientedDenseMap` here.
-    data_inst_output_ids: FxHashMap<DataInst, spv::Id>,
+    region_inputs_source: EntityOrientedDenseMap<ControlRegion, RegionInputsSource>,
+    data_insts: EntityOrientedDenseMap<DataInst, DataInstLifting>,
 
     label_ids: FxHashMap<CfgPoint, spv::Id>,
     blocks: FxIndexMap<CfgPoint, BlockLifting<'a>>,
@@ -318,6 +489,44 @@ struct FuncBodyLifting<'a> {
 enum RegionInputsSource {
     FuncParams,
     LoopHeaderPhis(ControlNode),
+}
+
+struct DataInstLifting {
+    result_id: Option<spv::Id>,
+
+    /// If the SPIR-V result type is "aggregate" (`OpTypeStruct`/`OpTypeArray`),
+    /// this describes how to extract its leaves, which is necessary as on the
+    /// SPIR-T side, [`Value::DataInstOutput`] can only refer to individual leaves.
+    disaggregate_result: Option<DisaggregateToLeaves>,
+
+    /// `reaggregate_inputs[i]` describes how to recreate the "aggregate" value
+    /// demanded by [`spv::InstLowering`]'s `disaggregated_inputs[i]`.
+    reaggregate_inputs: SmallVec<[ReaggregateFromLeaves; 1]>,
+}
+
+/// All the information necessary to decompose a SPIR-V "aggregate" value into
+/// its leaves, with one `OpCompositeExtract` per leaf.
+//
+// FIXME(eddyb) it might be more efficient to only extract actually used leaves,
+// or chain partial extracts following nesting structure - but this is simpler.
+struct DisaggregateToLeaves {
+    aggregate: SpvAggregate,
+    // FIXME(eddyb) should this use an ID range instead of `SmallVec<[spv::Id; 4]>`?
+    op_composite_extract_result_ids: SmallVec<[spv::Id; 4]>,
+}
+
+/// All the information necessary to recreate a SPIR-V "aggregate" value, with
+/// one `OpCompositeInsert` per leaf (starting with an `OpUndef` of that type).
+//
+// FIXME(eddyb) it might be more efficient to use other strategies, such as
+// `OpCompositeConstruct`, special-casing constants, reusing whole results
+// of other `DataInstDef`s with an aggregate result, etc. - but this is simpler
+// for now, and it reuses the "one instruction per leaf" used for extractions.
+struct ReaggregateFromLeaves {
+    aggregate: SpvAggregate,
+    op_undef: Const,
+    // FIXME(eddyb) should this use an ID range instead of `SmallVec<[spv::Id; 4]>`?
+    op_composite_insert_result_ids: SmallVec<[spv::Id; 4]>,
 }
 
 /// Any of the possible points in structured or unstructured SPIR-T control-flow,
@@ -362,6 +571,11 @@ struct Terminator<'a> {
     attrs: AttrSet,
 
     kind: Cow<'a, cfg::ControlInstKind>,
+
+    /// If this is a [`cfg::ControlInstKind::Return`] with `inputs.len() > 1`,
+    /// this ID is for the `OpCompositeConstruct` needed to produce the single
+    /// `OpTypStruct` (`spv_func_ret_type`) value required by `OpReturnValue`.
+    reaggregated_return_value_id: Option<spv::Id>,
 
     // FIXME(eddyb) use `Cow` or something, but ideally the "owned" case always
     // has at most one input, so allocating a whole `Vec` for that seems unwise.
@@ -553,7 +767,7 @@ impl<'a> FuncBodyLifting<'a> {
         let wk = &spec::Spec::get().well_known;
         let cx = id_allocator.cx;
 
-        let mut region_inputs_source = FxHashMap::default();
+        let mut region_inputs_source = EntityOrientedDenseMap::new();
         region_inputs_source.insert(func_def_body.body, RegionInputsSource::FuncParams);
 
         // Create a SPIR-V block for every CFG point needing one.
@@ -563,7 +777,7 @@ impl<'a> FuncBodyLifting<'a> {
 
             let phis = match point {
                 CfgPoint::RegionEntry(region) => {
-                    if region_inputs_source.contains_key(&region) {
+                    if region_inputs_source.get(region).is_some() {
                         // Region inputs handled by the parent of the region.
                         SmallVec::new()
                     } else {
@@ -666,6 +880,12 @@ impl<'a> FuncBodyLifting<'a> {
                         Terminator {
                             attrs: *attrs,
                             kind: Cow::Borrowed(kind),
+                            reaggregated_return_value_id: match kind {
+                                cfg::ControlInstKind::Return if inputs.len() > 1 => {
+                                    Some((id_allocator.alloc_id)())
+                                }
+                                _ => None,
+                            },
                             // FIXME(eddyb) borrow these whenever possible.
                             inputs: inputs.clone(),
                             targets: targets
@@ -683,10 +903,16 @@ impl<'a> FuncBodyLifting<'a> {
                     } else {
                         // Structured return out of the function body.
                         assert!(region == func_def_body.body);
+                        let inputs = func_def_body.at_body().def().outputs.clone();
                         Terminator {
                             attrs: AttrSet::default(),
                             kind: Cow::Owned(cfg::ControlInstKind::Return),
-                            inputs: func_def_body.at_body().def().outputs.clone(),
+                            reaggregated_return_value_id: if inputs.len() > 1 {
+                                Some((id_allocator.alloc_id)())
+                            } else {
+                                None
+                            },
+                            inputs,
                             targets: [].into_iter().collect(),
                             target_phi_values: FxIndexMap::default(),
                             merge: None,
@@ -709,6 +935,7 @@ impl<'a> FuncBodyLifting<'a> {
                         } => Terminator {
                             attrs: AttrSet::default(),
                             kind: Cow::Owned(cfg::ControlInstKind::SelectBranch(kind.clone())),
+                            reaggregated_return_value_id: None,
                             inputs: [*scrutinee].into_iter().collect(),
                             targets: cases
                                 .iter()
@@ -725,6 +952,7 @@ impl<'a> FuncBodyLifting<'a> {
                         } => Terminator {
                             attrs: AttrSet::default(),
                             kind: Cow::Owned(cfg::ControlInstKind::Branch),
+                            reaggregated_return_value_id: None,
                             inputs: [].into_iter().collect(),
                             targets: [CfgPoint::RegionEntry(*body)].into_iter().collect(),
                             target_phi_values: FxIndexMap::default(),
@@ -762,6 +990,7 @@ impl<'a> FuncBodyLifting<'a> {
                         ControlNodeKind::Select { .. } => Terminator {
                             attrs: AttrSet::default(),
                             kind: Cow::Owned(cfg::ControlInstKind::Branch),
+                            reaggregated_return_value_id: None,
                             inputs: [].into_iter().collect(),
                             targets: [parent_exit].into_iter().collect(),
                             target_phi_values: region_outputs
@@ -793,6 +1022,7 @@ impl<'a> FuncBodyLifting<'a> {
                                 Terminator {
                                     attrs: AttrSet::default(),
                                     kind: Cow::Owned(cfg::ControlInstKind::Branch),
+                                    reaggregated_return_value_id: None,
                                     inputs: [].into_iter().collect(),
                                     targets: [backedge].into_iter().collect(),
                                     target_phi_values,
@@ -804,6 +1034,7 @@ impl<'a> FuncBodyLifting<'a> {
                                     kind: Cow::Owned(cfg::ControlInstKind::SelectBranch(
                                         SelectionKind::BoolCond,
                                     )),
+                                    reaggregated_return_value_id: None,
                                     inputs: [repeat_condition].into_iter().collect(),
                                     targets: [backedge, parent_exit].into_iter().collect(),
                                     target_phi_values,
@@ -819,6 +1050,7 @@ impl<'a> FuncBodyLifting<'a> {
                 (_, Some(succ_cursor)) => Terminator {
                     attrs: AttrSet::default(),
                     kind: Cow::Owned(cfg::ControlInstKind::Branch),
+                    reaggregated_return_value_id: None,
                     inputs: [].into_iter().collect(),
                     targets: [succ_cursor.point].into_iter().collect(),
                     target_phi_values: FxIndexMap::default(),
@@ -912,6 +1144,7 @@ impl<'a> FuncBodyLifting<'a> {
                 let Terminator {
                     attrs,
                     kind,
+                    reaggregated_return_value_id,
                     inputs,
                     targets,
                     target_phi_values,
@@ -920,6 +1153,7 @@ impl<'a> FuncBodyLifting<'a> {
 
                 *attrs == AttrSet::default()
                     && matches!(**kind, cfg::ControlInstKind::Branch)
+                    && reaggregated_return_value_id.is_none()
                     && inputs.is_empty()
                     && targets.len() == 1
                     && target_phi_values.is_empty()
@@ -946,6 +1180,7 @@ impl<'a> FuncBodyLifting<'a> {
                             Terminator {
                                 attrs: Default::default(),
                                 kind: Cow::Owned(cfg::ControlInstKind::Unreachable),
+                                reaggregated_return_value_id: None,
                                 inputs: Default::default(),
                                 targets: Default::default(),
                                 target_phi_values: Default::default(),
@@ -1006,18 +1241,94 @@ impl<'a> FuncBodyLifting<'a> {
             }
         }
 
-        let all_insts_with_output = blocks
+        let mut data_insts = EntityOrientedDenseMap::new();
+        let all_func_at_data_insts = blocks
             .values()
             .flat_map(|block| block.insts.iter().copied())
-            .flat_map(|insts| func_def_body.at(insts))
-            .filter(|&func_at_inst| cx[func_at_inst.def().form].output_type.is_some())
-            .map(|func_at_inst| func_at_inst.position);
+            .flat_map(|insts| func_def_body.at(insts));
+        for func_at_inst in all_func_at_data_insts {
+            let data_inst_form_def = &cx[func_at_inst.def().form];
+
+            let mut call_spv_inst_lowering = spv::InstLowering::default();
+            let spv_inst_lowering = match &data_inst_form_def.kind {
+                // Disallowed while visiting.
+                DataInstKind::QPtr(_) => unreachable!(),
+
+                DataInstKind::FuncCall(callee) => {
+                    if data_inst_form_def.output_types.len() > 1 {
+                        call_spv_inst_lowering.disaggregated_output =
+                            Some(id_allocator.ids.funcs[callee].spv_func_ret_type);
+                    }
+                    &call_spv_inst_lowering
+                }
+
+                DataInstKind::SpvInst(_, lowering) | DataInstKind::SpvExtInst { lowering, .. } => {
+                    lowering
+                }
+            };
+
+            let reaggregate_inputs = spv_inst_lowering
+                .disaggregated_inputs
+                .iter()
+                .map(|&(_, ty)| {
+                    let aggregate = id_allocator.spv_aggregate(ty);
+                    let op_undef = cx.intern(ConstDef {
+                        attrs: AttrSet::default(),
+                        ty,
+                        ctor: ConstCtor::SpvInst(wk.OpUndef.into()),
+                        ctor_args: [].into_iter().collect(),
+                    });
+                    id_allocator.visit_const_use(op_undef);
+                    let op_composite_insert_result_ids = aggregate
+                        .leaves
+                        .iter()
+                        .map(|_| (id_allocator.alloc_id)())
+                        .collect();
+                    ReaggregateFromLeaves {
+                        aggregate,
+                        op_undef,
+                        op_composite_insert_result_ids,
+                    }
+                })
+                .collect();
+
+            // `OpFunctionCall always has a result (but may be `OpTypeVoid`-typed).
+            let has_result = matches!(data_inst_form_def.kind, DataInstKind::FuncCall(_))
+                || spv_inst_lowering.disaggregated_output.is_some()
+                || !data_inst_form_def.output_types.is_empty();
+            let result_id = if has_result {
+                Some((id_allocator.alloc_id)())
+            } else {
+                None
+            };
+
+            let disaggregate_result = spv_inst_lowering.disaggregated_output.map(|ty| {
+                let aggregate = id_allocator.spv_aggregate(ty);
+                let op_composite_extract_result_ids = aggregate
+                    .leaves
+                    .iter()
+                    .map(|_| (id_allocator.alloc_id)())
+                    .collect();
+                DisaggregateToLeaves {
+                    aggregate,
+                    op_composite_extract_result_ids,
+                }
+            });
+
+            data_insts.insert(
+                func_at_inst.position,
+                DataInstLifting {
+                    result_id,
+                    disaggregate_result,
+                    reaggregate_inputs,
+                },
+            );
+        }
 
         Self {
             region_inputs_source,
-            data_inst_output_ids: all_insts_with_output
-                .map(|inst| (inst, (id_allocator.alloc_id)()))
-                .collect(),
+            data_insts,
+
             label_ids: blocks
                 .keys()
                 .map(|&point| (point, (id_allocator.alloc_id)()))
@@ -1028,8 +1339,12 @@ impl<'a> FuncBodyLifting<'a> {
 }
 
 /// Maybe-decorated "lazy" SPIR-V instruction, allowing separately emitting
-/// decorations from attributes, and the instruction itself, without eagerly
-/// allocating all the instructions.
+/// *both* decorations (from certain [`Attr`]s), *and* the instruction itself,
+/// without eagerly allocating all the instructions.
+///
+/// Note that SPIR-T disaggregating SPIR-V `OpTypeStruct`/`OpTypeArray`s values
+/// may require additional [`spv::Inst`]s for each `LazyInst`, either for
+/// reaggregating inputs, or taking apart aggregate outputs.
 #[derive(Copy, Clone)]
 enum LazyInst<'a, 'b> {
     Global(Global),
@@ -1050,15 +1365,25 @@ enum LazyInst<'a, 'b> {
     },
     DataInst {
         parent_func_ids: &'b FuncIds<'a>,
-        result_id: Option<spv::Id>,
         data_inst_def: &'a DataInstDef,
+        data_inst_lifting: &'b DataInstLifting,
     },
+    // FIXME(eddyb) should merge instructions be generated by `Terminator`?
     Merge(Merge<spv::Id>),
     Terminator {
         parent_func_ids: &'b FuncIds<'a>,
         terminator: &'b Terminator<'a>,
     },
     OpFunctionEnd,
+}
+
+/// [`Attr::SpvDebugLine`], extracted from [`AttrSet`], and used for emitting
+/// `OpLine`/`OpNoLine` SPIR-V instructions.
+#[derive(Copy, Clone, PartialEq, Eq)]
+struct SpvDebugLine {
+    file_path_id: spv::Id,
+    line: u32,
+    col: u32,
 }
 
 impl LazyInst<'_, '_> {
@@ -1112,9 +1437,9 @@ impl LazyInst<'_, '_> {
             } => (Some(phi.result_id), phi.attrs, None),
             Self::DataInst {
                 parent_func_ids: _,
-                result_id,
                 data_inst_def,
-            } => (result_id, data_inst_def.attrs, None),
+                data_inst_lifting,
+            } => (data_inst_lifting.result_id, data_inst_def.attrs, None),
             Self::Merge(_) => (None, AttrSet::default(), None),
             Self::Terminator {
                 parent_func_ids: _,
@@ -1124,11 +1449,16 @@ impl LazyInst<'_, '_> {
         }
     }
 
-    fn to_inst_and_attrs(
+    /// Expand this `LazyInst` to one or more (see disaggregation/reaggregation
+    /// note in [`LazyInst`]'s doc comment for when it can be more than one)
+    /// [`spv::Inst`]s (with their respective [`SpvDebugLine`]s, if applicable),
+    /// with `each_spv_inst_with_debug_line` being called for each one.
+    fn for_each_spv_inst_with_debug_line(
         self,
         module: &Module,
         ids: &ModuleIds<'_>,
-    ) -> (spv::InstWithIds, AttrSet) {
+        mut each_spv_inst_with_debug_line: impl FnMut(spv::InstWithIds, Option<SpvDebugLine>),
+    ) {
         let wk = &spec::Spec::get().well_known;
         let cx = module.cx_ref();
 
@@ -1141,7 +1471,7 @@ impl LazyInst<'_, '_> {
             Value::ControlRegionInput { region, input_idx } => {
                 let input_idx = usize::try_from(input_idx).unwrap();
                 let parent_func_body_lifting = parent_func_ids.body.as_ref().unwrap();
-                match parent_func_body_lifting.region_inputs_source.get(&region) {
+                match parent_func_body_lifting.region_inputs_source.get(region) {
                     Some(RegionInputsSource::FuncParams) => parent_func_ids.param_ids[input_idx],
                     Some(&RegionInputsSource::LoopHeaderPhis(loop_node)) => {
                         parent_func_body_lifting.blocks[&CfgPoint::ControlNodeEntry(loop_node)].phis
@@ -1164,14 +1494,40 @@ impl LazyInst<'_, '_> {
                     .phis[usize::try_from(output_idx).unwrap()]
                 .result_id
             }
-            Value::DataInstOutput(inst) => {
-                parent_func_ids.body.as_ref().unwrap().data_inst_output_ids[&inst]
+            Value::DataInstOutput { inst, output_idx } => {
+                let output_idx = usize::try_from(output_idx).unwrap();
+                let data_inst_lifting = &parent_func_ids.body.as_ref().unwrap().data_insts[inst];
+                if let Some(disaggregate_result) = &data_inst_lifting.disaggregate_result {
+                    disaggregate_result.op_composite_extract_result_ids[output_idx]
+                } else {
+                    assert_eq!(output_idx, 0);
+                    data_inst_lifting.result_id.unwrap()
+                }
             }
         };
 
         let (result_id, attrs, _) = self.result_id_attrs_and_import(module, ids);
-        let inst = match self {
-            Self::Global(global) => match global {
+
+        // FIXME(eddyb) make this less of a search and more of a
+        // lookup by splitting attrs into key and value parts.
+        let spv_debug_line = cx[attrs].attrs.iter().find_map(|attr| match *attr {
+            Attr::SpvDebugLine {
+                file_path,
+                line,
+                col,
+            } => Some(SpvDebugLine {
+                file_path_id: ids.debug_strings[&cx[file_path.0]],
+                line,
+                col,
+            }),
+            _ => None,
+        });
+
+        // HACK(eddyb) there is no need to allow `spv_debug_line` to vary per-inst.
+        let mut each_inst = |inst| each_spv_inst_with_debug_line(inst, spv_debug_line);
+
+        match self {
+            Self::Global(global) => each_inst(match global {
                 Global::Type(ty) => {
                     let ty_def = &cx[ty];
                     match &ty_def.ctor {
@@ -1247,7 +1603,7 @@ impl LazyInst<'_, '_> {
                         ConstCtor::SpvStringLiteralForExtInst(_) => unreachable!(),
                     }
                 }
-            },
+            }),
             Self::OpFunction {
                 func_decl: _,
                 func_ids,
@@ -1267,7 +1623,7 @@ impl LazyInst<'_, '_> {
                     })
                     .unwrap_or(0);
 
-                spv::InstWithIds {
+                each_inst(spv::InstWithIds {
                     without_ids: spv::Inst {
                         opcode: wk.OpFunction,
                         imms: iter::once(spv::Imm::Short(wk.FunctionControl, func_ctrl)).collect(),
@@ -1275,24 +1631,24 @@ impl LazyInst<'_, '_> {
                     result_type_id: Some(ids.globals[&Global::Type(func_ids.spv_func_ret_type)]),
                     result_id,
                     ids: iter::once(ids.globals[&Global::Type(func_ids.spv_func_type)]).collect(),
-                }
+                });
             }
-            Self::OpFunctionParameter { param_id: _, param } => spv::InstWithIds {
+            Self::OpFunctionParameter { param_id: _, param } => each_inst(spv::InstWithIds {
                 without_ids: wk.OpFunctionParameter.into(),
                 result_type_id: Some(ids.globals[&Global::Type(param.ty)]),
                 result_id,
                 ids: [].into_iter().collect(),
-            },
-            Self::OpLabel { label_id: _ } => spv::InstWithIds {
+            }),
+            Self::OpLabel { label_id: _ } => each_inst(spv::InstWithIds {
                 without_ids: wk.OpLabel.into(),
                 result_type_id: None,
                 result_id,
                 ids: [].into_iter().collect(),
-            },
+            }),
             Self::OpPhi {
                 parent_func_ids,
                 phi,
-            } => spv::InstWithIds {
+            } => each_inst(spv::InstWithIds {
                 without_ids: wk.OpPhi.into(),
                 result_type_id: Some(ids.globals[&Global::Type(phi.ty)]),
                 result_id: Some(phi.result_id),
@@ -1306,46 +1662,127 @@ impl LazyInst<'_, '_> {
                         ]
                     })
                     .collect(),
-            },
+            }),
             Self::DataInst {
                 parent_func_ids,
-                result_id: _,
                 data_inst_def,
+                data_inst_lifting,
             } => {
-                let DataInstFormDef { kind, output_type } = &cx[data_inst_def.form];
-                let (inst, extra_initial_id_operand) = match kind {
+                let DataInstFormDef { kind, output_types } = &cx[data_inst_def.form];
+
+                let mut id_operands = SmallVec::new();
+
+                let mut call_spv_inst_lowering = spv::InstLowering::default();
+                let mut override_result_type = None;
+                let (inst, spv_inst_lowering) = match kind {
                     // Disallowed while visiting.
                     DataInstKind::QPtr(_) => unreachable!(),
 
-                    &DataInstKind::FuncCall(callee) => {
-                        (wk.OpFunctionCall.into(), Some(ids.funcs[&callee].func_id))
+                    // `OpFunctionCall always has a result (but may be `OpTypeVoid`-typed).
+                    DataInstKind::FuncCall(callee) => {
+                        let callee_ids = &ids.funcs[callee];
+                        override_result_type = Some(callee_ids.spv_func_ret_type);
+                        if output_types.len() > 1 {
+                            call_spv_inst_lowering.disaggregated_output = override_result_type;
+                        }
+                        id_operands.push(callee_ids.func_id);
+                        (wk.OpFunctionCall.into(), &call_spv_inst_lowering)
                     }
-                    DataInstKind::SpvInst(inst) => (inst.clone(), None),
-                    &DataInstKind::SpvExtInst { ext_set, inst } => (
-                        spv::Inst {
-                            opcode: wk.OpExtInst,
-                            imms: iter::once(spv::Imm::Short(wk.LiteralExtInstInteger, inst))
-                                .collect(),
-                        },
-                        Some(ids.ext_inst_imports[&cx[ext_set]]),
-                    ),
-                };
-                spv::InstWithIds {
-                    without_ids: inst,
-                    result_type_id: output_type.map(|ty| ids.globals[&Global::Type(ty)]),
-                    result_id,
-                    ids: extra_initial_id_operand
-                        .into_iter()
-                        .chain(
-                            data_inst_def
-                                .inputs
-                                .iter()
-                                .map(|&v| value_to_id(parent_func_ids, v)),
+                    DataInstKind::SpvInst(inst, lowering) => (inst.clone(), lowering),
+                    DataInstKind::SpvExtInst {
+                        ext_set,
+                        inst,
+                        lowering,
+                    } => {
+                        id_operands.push(ids.ext_inst_imports[&cx[*ext_set]]);
+                        (
+                            spv::Inst {
+                                opcode: wk.OpExtInst,
+                                imms: [spv::Imm::Short(wk.LiteralExtInstInteger, *inst)]
+                                    .into_iter()
+                                    .collect(),
+                            },
+                            lowering,
                         )
-                        .collect(),
+                    }
+                };
+
+                // Emit any `OpCompositeInsert`s needed by the inputs, first,
+                // while gathering the `id_operands` for the instruction itself.
+                let mut reaggregate_inputs = data_inst_lifting.reaggregate_inputs.iter();
+                for id_operand in spv_inst_lowering.reaggreate_inputs(&data_inst_def.inputs) {
+                    let value_to_id = |v| value_to_id(parent_func_ids, v);
+                    let id_operand = match id_operand {
+                        spv::ReaggregatedIdOperand::Direct(v) => value_to_id(v),
+                        spv::ReaggregatedIdOperand::Aggregate { ty, leaves } => {
+                            let result_type_id = Some(ids.globals[&Global::Type(ty)]);
+
+                            let ReaggregateFromLeaves {
+                                aggregate,
+                                op_undef,
+                                op_composite_insert_result_ids,
+                            } = reaggregate_inputs.next().unwrap();
+                            let mut aggregate_id = ids.globals[&Global::Const(*op_undef)];
+                            for ((leaf, &op_composite_insert_result_id), &leaf_value) in aggregate
+                                .leaves
+                                .iter()
+                                .zip_eq(op_composite_insert_result_ids)
+                                .zip_eq(leaves)
+                            {
+                                each_inst(spv::InstWithIds {
+                                    without_ids: leaf.op_composite_insert(),
+                                    result_type_id,
+                                    result_id: Some(op_composite_insert_result_id),
+                                    ids: [value_to_id(leaf_value), aggregate_id]
+                                        .into_iter()
+                                        .collect(),
+                                });
+                                aggregate_id = op_composite_insert_result_id;
+                            }
+                            aggregate_id
+                        }
+                    };
+                    id_operands.push(id_operand);
+                }
+                assert!(reaggregate_inputs.next().is_none());
+
+                let result_type = override_result_type
+                    .or(spv_inst_lowering.disaggregated_output)
+                    .or_else(|| {
+                        assert!(output_types.len() <= 1);
+                        output_types.get(0).copied()
+                    });
+                each_inst(spv::InstWithIds {
+                    without_ids: inst,
+                    result_type_id: result_type.map(|ty| ids.globals[&Global::Type(ty)]),
+                    result_id,
+                    ids: id_operands,
+                });
+
+                // Emit any `OpCompositeExtract`s needed for the result, last.
+                if let Some(DisaggregateToLeaves {
+                    aggregate,
+                    op_composite_extract_result_ids,
+                }) = &data_inst_lifting.disaggregate_result
+                {
+                    let aggregate_id = result_id.unwrap();
+                    for ((leaf, &op_composite_extract_result_id), &leaf_type) in aggregate
+                        .leaves
+                        .iter()
+                        .zip_eq(op_composite_extract_result_ids)
+                        .zip_eq(output_types)
+                    {
+                        each_inst(spv::InstWithIds {
+                            without_ids: leaf.op_composite_extract(),
+                            result_type_id: Some(ids.globals[&Global::Type(leaf_type)]),
+                            result_id: Some(op_composite_extract_result_id),
+                            ids: [aggregate_id].into_iter().collect(),
+                        });
+                    }
                 }
             }
-            Self::Merge(Merge::Selection(merge_label_id)) => spv::InstWithIds {
+            // FIXME(eddyb) should merge instructions be generated by `Terminator`?
+            Self::Merge(Merge::Selection(merge_label_id)) => each_inst(spv::InstWithIds {
                 without_ids: spv::Inst {
                     opcode: wk.OpSelectionMerge,
                     imms: [spv::Imm::Short(wk.SelectionControl, 0)]
@@ -1355,11 +1792,11 @@ impl LazyInst<'_, '_> {
                 result_type_id: None,
                 result_id: None,
                 ids: [merge_label_id].into_iter().collect(),
-            },
+            }),
             Self::Merge(Merge::Loop {
                 loop_merge: merge_label_id,
                 loop_continue: continue_label_id,
-            }) => spv::InstWithIds {
+            }) => each_inst(spv::InstWithIds {
                 without_ids: spv::Inst {
                     opcode: wk.OpLoopMerge,
                     imms: [spv::Imm::Short(wk.LoopControl, 0)].into_iter().collect(),
@@ -1367,17 +1804,49 @@ impl LazyInst<'_, '_> {
                 result_type_id: None,
                 result_id: None,
                 ids: [merge_label_id, continue_label_id].into_iter().collect(),
-            },
+            }),
             Self::Terminator {
                 parent_func_ids,
                 terminator,
             } => {
+                let parent_func_body_lifting = parent_func_ids.body.as_ref().unwrap();
+                let mut id_operands = terminator
+                    .inputs
+                    .iter()
+                    .map(|&v| value_to_id(parent_func_ids, v))
+                    .chain(
+                        terminator
+                            .targets
+                            .iter()
+                            .map(|&target| parent_func_body_lifting.label_ids[&target]),
+                    )
+                    .collect();
+
+                if let Some(reaggregated_value_id) = terminator.reaggregated_return_value_id {
+                    assert!(
+                        matches!(*terminator.kind, cfg::ControlInstKind::Return)
+                            && terminator.inputs.len() > 1
+                    );
+
+                    each_inst(spv::InstWithIds {
+                        without_ids: wk.OpCompositeConstruct.into(),
+                        result_type_id: Some(
+                            ids.globals[&Global::Type(parent_func_ids.spv_func_ret_type)],
+                        ),
+                        result_id: Some(reaggregated_value_id),
+                        ids: id_operands,
+                    });
+                    id_operands = [reaggregated_value_id].into_iter().collect();
+                }
+
                 let inst = match &*terminator.kind {
                     cfg::ControlInstKind::Unreachable => wk.OpUnreachable.into(),
                     cfg::ControlInstKind::Return => {
                         if terminator.inputs.is_empty() {
                             wk.OpReturn.into()
                         } else {
+                            // Multiple return values get reaggregated above.
+                            assert_eq!(id_operands.len(), 1);
                             wk.OpReturnValue.into()
                         }
                     }
@@ -1394,32 +1863,20 @@ impl LazyInst<'_, '_> {
                         inst.clone()
                     }
                 };
-                let parent_func_body_lifting = parent_func_ids.body.as_ref().unwrap();
-                spv::InstWithIds {
+                each_inst(spv::InstWithIds {
                     without_ids: inst,
                     result_type_id: None,
                     result_id: None,
-                    ids: terminator
-                        .inputs
-                        .iter()
-                        .map(|&v| value_to_id(parent_func_ids, v))
-                        .chain(
-                            terminator
-                                .targets
-                                .iter()
-                                .map(|&target| parent_func_body_lifting.label_ids[&target]),
-                        )
-                        .collect(),
-                }
+                    ids: id_operands,
+                });
             }
-            Self::OpFunctionEnd => spv::InstWithIds {
+            Self::OpFunctionEnd => each_inst(spv::InstWithIds {
                 without_ids: wk.OpFunctionEnd.into(),
                 result_type_id: None,
                 result_id: None,
                 ids: [].into_iter().collect(),
-            },
-        };
-        (inst, attrs)
+            }),
+        }
     }
 }
 
@@ -1483,6 +1940,7 @@ impl Module {
                 ids: ModuleIds::default(),
                 data_inst_forms_seen: FxIndexSet::default(),
                 global_vars_seen: FxIndexSet::default(),
+                cached_spv_aggregates: FxHashMap::default(),
             };
             id_allocator.visit_module(self);
 
@@ -1526,7 +1984,7 @@ impl Module {
                         _ => unreachable!(),
                     };
 
-                    let param_insts = func_ids.param_ids.iter().zip(&func_decl.params).map(
+                    let param_insts = func_ids.param_ids.iter().zip_eq(&func_decl.params).map(
                         |(&param_id, param)| LazyInst::OpFunctionParameter { param_id, param },
                     );
                     let body_insts = body_with_lifting.map(|(func_def_body, func_body_lifting)| {
@@ -1556,13 +2014,9 @@ impl Module {
                                             let data_inst_def = func_at_inst.def();
                                             LazyInst::DataInst {
                                                 parent_func_ids: func_ids,
-                                                result_id: cx[data_inst_def.form].output_type.map(
-                                                    |_| {
-                                                        func_body_lifting.data_inst_output_ids
-                                                            [&func_at_inst.position]
-                                                    },
-                                                ),
                                                 data_inst_def,
+                                                data_inst_lifting: &func_body_lifting.data_insts
+                                                    [func_at_inst.position],
                                             }
                                         }),
                                 )
@@ -1848,61 +2302,64 @@ impl Module {
         let mut current_debug_line = None;
         let mut current_block_id = None; // HACK(eddyb) for `current_debug_line` resets.
         for lazy_inst in global_and_func_insts {
-            let (inst, attrs) = lazy_inst.to_inst_and_attrs(self, ids);
+            let mut result: Result<(), _> = Ok(());
+            lazy_inst.for_each_spv_inst_with_debug_line(self, ids, |inst, new_debug_line| {
+                if result.is_err() {
+                    return;
+                }
 
-            // Reset line debuginfo when crossing/leaving blocks.
-            let new_block_id = if inst.opcode == wk.OpLabel {
-                Some(inst.result_id.unwrap())
-            } else if inst.opcode == wk.OpFunctionEnd {
-                None
-            } else {
-                current_block_id
-            };
-            if current_block_id != new_block_id {
-                current_debug_line = None;
-            }
-            current_block_id = new_block_id;
-
-            // Determine whether to emit `OpLine`/`OpNoLine` before `inst`,
-            // in order to end up with the expected line debuginfo.
-            // FIXME(eddyb) make this less of a search and more of a
-            // lookup by splitting attrs into key and value parts.
-            let new_debug_line = cx[attrs].attrs.iter().find_map(|attr| match *attr {
-                Attr::SpvDebugLine {
-                    file_path,
-                    line,
-                    col,
-                } => Some((ids.debug_strings[&cx[file_path.0]], line, col)),
-                _ => None,
-            });
-            if current_debug_line != new_debug_line {
-                let (opcode, imms, ids) = match new_debug_line {
-                    Some((file_path_id, line, col)) => (
-                        wk.OpLine,
-                        [
-                            spv::Imm::Short(wk.LiteralInteger, line),
-                            spv::Imm::Short(wk.LiteralInteger, col),
-                        ]
-                        .into_iter()
-                        .collect(),
-                        iter::once(file_path_id).collect(),
-                    ),
-                    None => (
-                        wk.OpNoLine,
-                        [].into_iter().collect(),
-                        [].into_iter().collect(),
-                    ),
+                // Reset line debuginfo when crossing/leaving blocks.
+                let new_block_id = if inst.opcode == wk.OpLabel {
+                    Some(inst.result_id.unwrap())
+                } else if inst.opcode == wk.OpFunctionEnd {
+                    None
+                } else {
+                    current_block_id
                 };
-                emitter.push_inst(&spv::InstWithIds {
-                    without_ids: spv::Inst { opcode, imms },
-                    result_type_id: None,
-                    result_id: None,
-                    ids,
-                })?;
-            }
-            current_debug_line = new_debug_line;
+                if current_block_id != new_block_id {
+                    current_debug_line = None;
+                }
+                current_block_id = new_block_id;
 
-            emitter.push_inst(&inst)?;
+                // Determine whether to emit `OpLine`/`OpNoLine` before `inst`,
+                // in order to end up with the expected line debuginfo.
+                if current_debug_line != new_debug_line {
+                    let (opcode, imms, ids) = match new_debug_line {
+                        Some(SpvDebugLine {
+                            file_path_id,
+                            line,
+                            col,
+                        }) => (
+                            wk.OpLine,
+                            [
+                                spv::Imm::Short(wk.LiteralInteger, line),
+                                spv::Imm::Short(wk.LiteralInteger, col),
+                            ]
+                            .into_iter()
+                            .collect(),
+                            iter::once(file_path_id).collect(),
+                        ),
+                        None => (
+                            wk.OpNoLine,
+                            [].into_iter().collect(),
+                            [].into_iter().collect(),
+                        ),
+                    };
+                    result = emitter.push_inst(&spv::InstWithIds {
+                        without_ids: spv::Inst { opcode, imms },
+                        result_type_id: None,
+                        result_id: None,
+                        ids,
+                    });
+                    if result.is_err() {
+                        return;
+                    }
+                }
+                current_debug_line = new_debug_line;
+
+                result = emitter.push_inst(&inst);
+            });
+            result?;
         }
 
         Ok(emitter)

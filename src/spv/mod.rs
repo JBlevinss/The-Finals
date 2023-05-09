@@ -9,11 +9,12 @@ pub mod read;
 pub mod spec;
 pub mod write;
 
-use crate::{FxIndexMap, InternedStr};
+use crate::{FxIndexMap, InternedStr, Type};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
 use std::iter;
 use std::num::NonZeroU32;
+use std::ops::Range;
 use std::string::FromUtf8Error;
 
 /// Semantic properties of a SPIR-V module (not tied to any IDs).
@@ -48,6 +49,70 @@ pub struct DebugSourceLang {
 #[derive(Clone, Default)]
 pub struct DebugSources {
     pub file_contents: FxIndexMap<InternedStr, String>,
+}
+
+/// Aspects of how a [`spv::Inst`](Inst) was produced by [`spv::lower`](lower),
+/// which were otherwise lost in the SPIR-T form, but are still required for
+/// [`spv::lift`](lift) to reproduce the original SPIR-V instruction.
+///
+/// Primarily used within [`DataInstKind`](crate::DataInstKind) due to SPIR-V
+/// instructions that take or produce "aggregates" (`OpTypeStruct`/`OpTypeArray`)
+/// and which may require the exact original types (i.e. may not be valid when
+/// using a fresh `OpTypeStruct` of the flattened non-"aggregate" components).
+#[derive(Clone, Default, PartialEq, Eq, Hash)]
+pub struct InstLowering {
+    // FIXME(eddyb) should this be named "result" instead of "output", somewhat
+    // standardizing the idea that 1 SPIR-V "result" maps to N SPIR-T "outputs"?
+    pub disaggregated_output: Option<Type>,
+
+    pub disaggregated_inputs: SmallVec<[(Range<u32>, Type); 1]>,
+}
+
+/// Helper type for [`InstLowering::reaggreate_inputs`], which corresponds to
+/// one or more inputs of a SPIR-V instruction (after being lowered to SPIR-T),
+/// according to the [`InstLowering`] (and its `disaggregated_inputs` field).
+#[derive(Copy, Clone)]
+pub enum ReaggregatedIdOperand<'a, T> {
+    Direct(T),
+    Aggregate { ty: Type, leaves: &'a [T] },
+}
+
+impl InstLowering {
+    pub fn reaggreate_inputs<'a, T: Copy>(
+        &'a self,
+        inputs: &'a [T],
+    ) -> impl Iterator<Item = ReaggregatedIdOperand<'a, T>> {
+        // HACK(eddyb) the `None` at the end handles remainining direct inputs.
+        let mut prev_end = 0;
+        self.disaggregated_inputs
+            .iter()
+            .map(Some)
+            .chain([None])
+            .flat_map(move |maybe_disaggregated| {
+                // FIXME(eddyb) the range manipulation is all over the place here.
+                let direct_range = prev_end
+                    ..maybe_disaggregated.map_or(inputs.len(), |(range, _)| range.start as usize);
+                assert!(direct_range.start <= direct_range.end);
+                prev_end = direct_range.end;
+
+                let direct_inputs = inputs[direct_range]
+                    .iter()
+                    .copied()
+                    .map(ReaggregatedIdOperand::Direct);
+
+                let aggregate_input = maybe_disaggregated.map(|(range, ty)| {
+                    let leaves_range = range.start as usize..range.end as usize;
+                    prev_end = leaves_range.end;
+
+                    ReaggregatedIdOperand::Aggregate {
+                        ty: *ty,
+                        leaves: &inputs[leaves_range],
+                    }
+                });
+
+                direct_inputs.chain(aggregate_input)
+            })
+    }
 }
 
 /// A SPIR-V instruction, in its minimal form (opcode and immediate operands).

@@ -81,6 +81,7 @@ def_well_known! {
         OpLine,
         OpNoLine,
 
+        OpTypeVoid,
         OpTypeBool,
         OpTypeInt,
         OpTypeFloat,
@@ -100,6 +101,9 @@ def_well_known! {
         OpConstantFalse,
         OpConstantTrue,
         OpConstant,
+        OpConstantNull,
+        OpConstantComposite,
+        OpSpecConstantComposite,
         OpUndef,
 
         OpVariable,
@@ -130,6 +134,10 @@ def_well_known! {
         OpPtrAccessChain,
         OpInBoundsPtrAccessChain,
         OpBitcast,
+
+        OpCompositeInsert,
+        OpCompositeExtract,
+        OpCompositeConstruct,
     ],
     operand_kind: OperandKind = [
         Capability,

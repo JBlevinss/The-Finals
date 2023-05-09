@@ -184,7 +184,10 @@ enum Use {
         control_node: ControlNode,
         output_idx: u32,
     },
-    DataInstOutput(DataInst),
+    DataInstOutput {
+        inst: DataInst,
+        output_idx: u32,
+    },
 
     // NOTE(eddyb) these overlap somewhat with other cases, but they're always
     // generated, even when there is no "use", for `multiversion` alignment.
@@ -207,7 +210,7 @@ impl From<Value> for Use {
                 control_node,
                 output_idx,
             },
-            Value::DataInstOutput(inst) => Use::DataInstOutput(inst),
+            Value::DataInstOutput { inst, output_idx } => Use::DataInstOutput { inst, output_idx },
         }
     }
 }
@@ -226,7 +229,7 @@ impl Use {
 
             Self::ControlRegionInput { .. }
             | Self::ControlNodeOutput { .. }
-            | Self::DataInstOutput(_) => "v",
+            | Self::DataInstOutput { .. } => "v",
 
             Self::AlignmentAnchorForControlRegion(_)
             | Self::AlignmentAnchorForControlNode(_)
@@ -572,7 +575,7 @@ impl<'a> Printer<'a> {
                 if let Use::ControlRegionLabel(_)
                 | Use::ControlRegionInput { .. }
                 | Use::ControlNodeOutput { .. }
-                | Use::DataInstOutput(_) = use_kind
+                | Use::DataInstOutput { .. } = use_kind
                 {
                     return (use_kind, UseStyle::Inline);
                 }
@@ -653,7 +656,7 @@ impl<'a> Printer<'a> {
                     Use::ControlRegionLabel(_)
                     | Use::ControlRegionInput { .. }
                     | Use::ControlNodeOutput { .. }
-                    | Use::DataInstOutput(_)
+                    | Use::DataInstOutput { .. }
                     | Use::AlignmentAnchorForControlRegion(_)
                     | Use::AlignmentAnchorForControlNode(_)
                     | Use::AlignmentAnchorForDataInst(_) => {
@@ -680,7 +683,7 @@ impl<'a> Printer<'a> {
                         | Use::ControlRegionLabel(_)
                         | Use::ControlRegionInput { .. }
                         | Use::ControlNodeOutput { .. }
-                        | Use::DataInstOutput(_)
+                        | Use::DataInstOutput { .. }
                         | Use::AlignmentAnchorForControlRegion(_)
                         | Use::AlignmentAnchorForControlNode(_)
                         | Use::AlignmentAnchorForDataInst(_) => {
@@ -727,7 +730,9 @@ impl<'a> Printer<'a> {
 
                     Use::ControlRegionInput { .. }
                     | Use::ControlNodeOutput { .. }
-                    | Use::DataInstOutput(_) => (&mut value_counter, use_styles.get_mut(&use_kind)),
+                    | Use::DataInstOutput { .. } => {
+                        (&mut value_counter, use_styles.get_mut(&use_kind))
+                    }
 
                     Use::AlignmentAnchorForControlRegion(_)
                     | Use::AlignmentAnchorForControlNode(_)
@@ -791,9 +796,15 @@ impl<'a> Printer<'a> {
 
                         if let ControlNodeKind::Block { insts } = *kind {
                             for func_at_inst in func_def_body.at(insts) {
-                                define(Use::AlignmentAnchorForDataInst(func_at_inst.position));
-                                if cx[func_at_inst.def().form].output_type.is_some() {
-                                    define(Use::DataInstOutput(func_at_inst.position));
+                                let inst = func_at_inst.position;
+                                define(Use::AlignmentAnchorForDataInst(inst));
+                                for (i, _) in
+                                    cx[func_at_inst.def().form].output_types.iter().enumerate()
+                                {
+                                    define(Use::DataInstOutput {
+                                        inst,
+                                        output_idx: i.try_into().unwrap(),
+                                    });
                                 }
                             }
                         }
@@ -1262,7 +1273,7 @@ impl Use {
                 Self::ControlRegionLabel(_)
                 | Self::ControlRegionInput { .. }
                 | Self::ControlNodeOutput { .. }
-                | Self::DataInstOutput(_) => "_".into(),
+                | Self::DataInstOutput { .. } => "_".into(),
 
                 Self::AlignmentAnchorForControlRegion(_)
                 | Self::AlignmentAnchorForControlNode(_)
@@ -2484,10 +2495,22 @@ impl Print for FuncDecl {
     fn print(&self, printer: &Printer<'_>) -> AttrsAndDef {
         let Self {
             attrs,
-            ret_type,
+            ret_types,
             params,
             def,
         } = self;
+
+        let sig_ret = if !ret_types.is_empty() {
+            let mut ret_types = ret_types.iter().map(|ty| ty.print(printer));
+            let ret_type = if ret_types.len() == 1 {
+                ret_types.next().unwrap()
+            } else {
+                pretty::join_comma_sep("(", ret_types, ")")
+            };
+            pretty::Fragment::new([" -> ".into(), ret_type])
+        } else {
+            pretty::Fragment::default()
+        };
 
         let sig = pretty::Fragment::new([
             pretty::join_comma_sep(
@@ -2505,8 +2528,7 @@ impl Print for FuncDecl {
                 }),
                 ")",
             ),
-            " -> ".into(),
-            ret_type.print(printer),
+            sig_ret,
         ]);
 
         let def_without_name = match def {
@@ -2679,25 +2701,51 @@ impl Print for FuncAt<'_, ControlNode> {
                     self.at(*insts)
                         .into_iter()
                         .map(|func_at_inst| {
+                            // FIXME(eddyb) should this be moved into its own
+                            // `impl Print for FuncAt<'_, DataInst>`?
+
+                            let inst = func_at_inst.position;
                             let data_inst_def = func_at_inst.def();
                             let mut data_inst_attrs_and_def = data_inst_def.print(printer);
                             // FIXME(eddyb) this is quite verbose for prepending.
                             data_inst_attrs_and_def.def_without_name = pretty::Fragment::new([
-                                Use::AlignmentAnchorForDataInst(func_at_inst.position)
-                                    .print_as_def(printer),
+                                Use::AlignmentAnchorForDataInst(inst).print_as_def(printer),
                                 data_inst_attrs_and_def.def_without_name,
                             ]);
-                            data_inst_attrs_and_def.insert_name_before_def(
-                                if printer.cx[data_inst_def.form].output_type.is_none() {
-                                    pretty::Fragment::default()
-                                } else {
-                                    pretty::Fragment::new([
-                                        Use::DataInstOutput(func_at_inst.position)
+                            let inst_output_types = &printer.cx[data_inst_def.form].output_types;
+                            let inst_outputs_header = if !inst_output_types.is_empty() {
+                                let mut outputs_with_types = inst_output_types
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(output_idx, &output_type)| {
+                                        (
+                                            Value::DataInstOutput {
+                                                inst,
+                                                output_idx: output_idx.try_into().unwrap(),
+                                            }
                                             .print_as_def(printer),
-                                        " = ".into(),
-                                    ])
-                                },
-                            )
+                                            output_type,
+                                        )
+                                    });
+                                let outputs_lhs = if outputs_with_types.len() == 1 {
+                                    outputs_with_types.next().unwrap().0
+                                } else {
+                                    pretty::join_comma_sep(
+                                        "(",
+                                        outputs_with_types.map(|(output, output_type)| {
+                                            pretty::Fragment::new([
+                                                output,
+                                                printer.pretty_type_ascription_suffix(output_type),
+                                            ])
+                                        }),
+                                        ")",
+                                    )
+                                };
+                                pretty::Fragment::new([outputs_lhs, " = ".into()])
+                            } else {
+                                pretty::Fragment::default()
+                            };
+                            data_inst_attrs_and_def.insert_name_before_def(inst_outputs_header)
                         })
                         .flat_map(|entry| [pretty::Node::ForceLineSeparation.into(), entry]),
                 )
@@ -2830,6 +2878,21 @@ impl Print for ControlNodeOutputDecl {
     }
 }
 
+impl Print for spv::ReaggregatedIdOperand<'_, Value> {
+    type Output = pretty::Fragment;
+    fn print(&self, printer: &Printer<'_>) -> pretty::Fragment {
+        match *self {
+            Self::Direct(v) => v.print(printer),
+            // FIXME(eddyb) should this be recursive? it's not on the
+            // output side, and we largely don't care about nesting.
+            Self::Aggregate { ty, leaves } => pretty::Fragment::new([
+                pretty::join_comma_sep("(", leaves.iter().map(|v| v.print(printer)), ")"),
+                printer.pretty_type_ascription_suffix(ty),
+            ]),
+        }
+    }
+}
+
 impl Print for DataInstDef {
     type Output = AttrsAndDef;
     fn print(&self, printer: &Printer<'_>) -> AttrsAndDef {
@@ -2841,13 +2904,14 @@ impl Print for DataInstDef {
 
         let attrs = attrs.print(printer);
 
-        let DataInstFormDef { kind, output_type } = &printer.cx[*form];
+        let DataInstFormDef { kind, output_types } = &printer.cx[*form];
 
-        let header = match kind {
+        let def_without_types = match kind {
             &DataInstKind::FuncCall(func) => pretty::Fragment::new([
                 printer.declarative_keyword_style().apply("call").into(),
                 " ".into(),
                 func.print(printer),
+                pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
             ]),
 
             DataInstKind::QPtr(op) => {
@@ -2971,47 +3035,35 @@ impl Print for DataInstDef {
                 // HACK(eddyb) this duplicates and intentionally breaks away from
                 // the style of SPIR-V instructions and how they handle immediates.
                 // FIXME(eddyb) pick a consistent style, this is getting annoying.
-                return AttrsAndDef {
-                    attrs,
-                    def_without_name: pretty::Fragment::new([
-                        printer
-                            .demote_style_for_namespace_prefix(printer.declarative_keyword_style())
-                            .apply("qptr.")
-                            .into(),
-                        printer.declarative_keyword_style().apply(name).into(),
-                        pretty::join_comma_sep(
-                            "(",
-                            qptr_input
-                                .map(|v| v.print(printer))
-                                .into_iter()
-                                .chain(extra_inputs),
-                            ")",
-                        ),
-                        output_type
-                            .map(|ty| printer.pretty_type_ascription_suffix(ty))
-                            .unwrap_or_default(),
-                    ]),
-                };
+                pretty::Fragment::new([
+                    printer
+                        .demote_style_for_namespace_prefix(printer.declarative_keyword_style())
+                        .apply("qptr.")
+                        .into(),
+                    printer.declarative_keyword_style().apply(name).into(),
+                    pretty::join_comma_sep(
+                        "(",
+                        qptr_input
+                            .map(|v| v.print(printer))
+                            .into_iter()
+                            .chain(extra_inputs),
+                        ")",
+                    ),
+                ])
             }
 
-            DataInstKind::SpvInst(inst) => {
-                return AttrsAndDef {
-                    attrs,
-                    def_without_name: pretty::Fragment::new([
-                        printer.pretty_spv_inst(
-                            printer.spv_op_style(),
-                            inst.opcode,
-                            &inst.imms,
-                            inputs,
-                            Print::print,
-                        ),
-                        output_type
-                            .map(|ty| printer.pretty_type_ascription_suffix(ty))
-                            .unwrap_or_default(),
-                    ]),
-                };
-            }
-            &DataInstKind::SpvExtInst { ext_set, inst } => {
+            DataInstKind::SpvInst(inst, lowering) => printer.pretty_spv_inst(
+                printer.spv_op_style(),
+                inst.opcode,
+                &inst.imms,
+                lowering.reaggreate_inputs(inputs),
+                |o, _| o.print(printer),
+            ),
+            DataInstKind::SpvExtInst {
+                ext_set,
+                inst,
+                lowering,
+            } => {
                 let wk = &spv::spec::Spec::get().well_known;
 
                 // FIXME(eddyb) should this be rendered more compactly?
@@ -3021,7 +3073,7 @@ impl Print for DataInstDef {
                     "<".into(),
                     printer
                         .string_literal_style()
-                        .apply(format!("{:?}", &printer.cx[ext_set]))
+                        .apply(format!("{:?}", &printer.cx[*ext_set]))
                         .into(),
                     ">).".into(),
                     printer.pretty_spv_opcode(printer.spv_op_style(), wk.OpExtInst),
@@ -3031,16 +3083,32 @@ impl Print for DataInstDef {
                         .apply(format!("{inst}"))
                         .into(),
                     ">".into(),
+                    pretty::join_comma_sep(
+                        "(",
+                        lowering.reaggreate_inputs(inputs).map(|o| o.print(printer)),
+                        ")",
+                    ),
                 ])
             }
         };
 
-        // FIXME(eddyb) deduplicate the "parens + optional type ascription"
-        // logic with `pretty_spv_inst`.
+        // NOTE(eddyb) this must fit the `inst_outputs_header` computed elsewhere.
+        // FIXME(eddyb) maybe the name prefix and type suffix should computed
+        // in the same function (i.e. move the naming here)?
+        let output_type_for_ascription_suffix = match output_types[..] {
+            [] => None,
+            [ty] => Some(ty),
+            _ => match kind {
+                DataInstKind::FuncCall(_) | DataInstKind::QPtr(_) => None,
+                DataInstKind::SpvInst(_, lowering) | DataInstKind::SpvExtInst { lowering, .. } => {
+                    lowering.disaggregated_output
+                }
+            },
+        };
+
         let def_without_name = pretty::Fragment::new([
-            header,
-            pretty::join_comma_sep("(", inputs.iter().map(|v| v.print(printer)), ")"),
-            output_type
+            def_without_types,
+            output_type_for_ascription_suffix
                 .map(|ty| printer.pretty_type_ascription_suffix(ty))
                 .unwrap_or_default(),
         ]);
@@ -3092,10 +3160,18 @@ impl Print for cfg::ControlInst {
             cfg::ControlInstKind::Return => {
                 // FIXME(eddyb) use `targets.is_empty()` when that is stabilized.
                 assert!(targets.len() == 0);
-                match inputs[..] {
-                    [] => kw("return"),
-                    [v] => pretty::Fragment::new([kw("return"), " ".into(), v.print(printer)]),
-                    _ => unreachable!(),
+                if inputs.is_empty() {
+                    kw("return")
+                } else {
+                    let inputs = match inputs[..] {
+                        [v] => v.print(printer),
+                        _ => pretty::join_comma_sep(
+                            "(",
+                            inputs.iter().map(|v| v.print(printer)),
+                            ")",
+                        ),
+                    };
+                    pretty::Fragment::new([kw("return"), " ".into(), inputs])
                 }
             }
             cfg::ControlInstKind::ExitInvocation(cfg::ExitInvocationKind::SpvInst(spv::Inst {

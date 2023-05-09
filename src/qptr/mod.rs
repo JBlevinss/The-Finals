@@ -38,7 +38,7 @@ pub enum QPtrAttr {
         pointee: OrdAssertEq<Type>,
     },
 
-    /// When applied to a `DataInst` with a `QPtr`-typed output value,
+    /// When applied to a `DataInst` with a single `QPtr`-typed output value,
     /// this describes the original `OpTypePointer` produced by an unknown
     /// SPIR-V instruction (likely creating it, without deriving from an input).
     ///

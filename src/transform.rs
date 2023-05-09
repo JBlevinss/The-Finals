@@ -551,13 +551,15 @@ impl InnerInPlaceTransform for FuncDecl {
     fn inner_in_place_transform_with(&mut self, transformer: &mut impl Transformer) {
         let Self {
             attrs,
-            ret_type,
+            ret_types,
             params,
             def,
         } = self;
 
         transformer.transform_attr_set_use(*attrs).apply_to(attrs);
-        transformer.transform_type_use(*ret_type).apply_to(ret_type);
+        for ty in ret_types {
+            transformer.transform_type_use(*ty).apply_to(ty);
+        }
         for param in params {
             param.inner_transform_with(transformer).apply_to(param);
         }
@@ -768,11 +770,13 @@ impl InnerInPlaceTransform for FuncAtMut<'_, DataInst> {
 
 impl InnerTransform for DataInstFormDef {
     fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
-        let Self { kind, output_type } = self;
+        let Self { kind, output_types } = self;
 
         transform!({
             kind -> match kind {
-                DataInstKind::FuncCall(func) => transformer.transform_func_use(*func).map(DataInstKind::FuncCall),
+                DataInstKind::FuncCall(func) => transform!({
+                    func -> transformer.transform_func_use(*func)
+                } => DataInstKind::FuncCall(func)),
                 DataInstKind::QPtr(op) => match op {
                     QPtrOp::FuncLocalVar(_)
                     | QPtrOp::HandleArrayIndex
@@ -783,16 +787,39 @@ impl InnerTransform for DataInstFormDef {
                     | QPtrOp::Load
                     | QPtrOp::Store => Transformed::Unchanged,
                 },
-                DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => Transformed::Unchanged,
+                DataInstKind::SpvInst(spv_inst, lowering) => transform!({
+                    lowering -> lowering.inner_transform_with(transformer)
+                } => DataInstKind::SpvInst(spv_inst.clone(), lowering)),
+                DataInstKind::SpvExtInst { ext_set, inst, lowering } => transform!({
+                    lowering -> lowering.inner_transform_with(transformer)
+                } => DataInstKind::SpvExtInst { ext_set: *ext_set, inst: *inst, lowering }),
             },
-            // FIXME(eddyb) this should be replaced with an impl of `InnerTransform`
-            // for `Option<T>` or some other helper, to avoid "manual transpose".
-            output_type -> output_type.map(|ty| transformer.transform_type_use(ty))
-                .map_or(Transformed::Unchanged, |t| t.map(Some)),
+            output_types -> Transformed::map_iter(output_types.iter(), |&ty| transformer.transform_type_use(ty))
+                .map(|new_iter| new_iter.collect()),
         } => Self {
             kind,
-            output_type,
+            output_types,
         })
+    }
+}
+
+impl InnerTransform for spv::InstLowering {
+    fn inner_transform_with(&self, transformer: &mut impl Transformer) -> Transformed<Self> {
+        let Self {
+            disaggregated_output,
+            disaggregated_inputs,
+        } = self;
+
+        transform!({
+            // FIXME(eddyb) this should be replaced with an impl of `InnerTransform`
+            // for `Option<T>` or some other helper, to avoid "manual transpose".
+            disaggregated_output -> disaggregated_output.map(|ty| transformer.transform_type_use(ty))
+                .map_or(Transformed::Unchanged, |t| t.map(Some)),
+            disaggregated_inputs -> Transformed::map_iter(
+                disaggregated_inputs.iter(),
+                |(range, ty)| transformer.transform_type_use(*ty).map(|ty| (range.clone(), ty))
+            ).map(|new_iter| new_iter.collect()),
+        } => Self { disaggregated_output, disaggregated_inputs })
     }
 }
 
@@ -842,7 +869,10 @@ impl InnerTransform for Value {
                 control_node: _,
                 output_idx: _,
             }
-            | Self::DataInstOutput(_) => Transformed::Unchanged,
+            | Self::DataInstOutput {
+                inst: _,
+                output_idx: _,
+            } => Transformed::Unchanged,
         }
     }
 }

@@ -428,24 +428,29 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         let func = func_at_data_inst_frozen.at(());
 
         let mut attrs = data_inst_def.attrs;
-        let DataInstFormDef {
-            ref kind,
-            output_type,
-        } = cx[data_inst_def.form];
+        let DataInstFormDef { kind, output_types } = &cx[data_inst_def.form];
 
-        let spv_inst = match kind {
-            DataInstKind::SpvInst(spv_inst) => spv_inst,
+        let (spv_inst, spv_inst_lowering) = match kind {
+            DataInstKind::SpvInst(spv_inst, lowering) => (spv_inst, lowering),
             _ => return Ok(Transformed::Unchanged),
         };
 
+        // HACK(eddyb) this is for easy bailing/asserting.
+        let disaggregated_output_or_inputs_during_lowering =
+            spv_inst_lowering.disaggregated_output.is_some()
+                || !spv_inst_lowering.disaggregated_inputs.is_empty();
+
         let replacement_kind_and_inputs = if spv_inst.opcode == wk.OpVariable {
+            assert!(!disaggregated_output_or_inputs_during_lowering);
+            assert_eq!(output_types.len(), 1);
             assert!(data_inst_def.inputs.len() <= 1);
-            let (_, var_data_type) = self
-                .lowerer
-                .as_spv_ptr_type(output_type.unwrap())
-                .ok_or_else(|| {
-                    LowerError(Diag::bug(["output type not an `OpTypePointer`".into()]))
-                })?;
+
+            let (_, var_data_type) =
+                self.lowerer
+                    .as_spv_ptr_type(output_types[0])
+                    .ok_or_else(|| {
+                        LowerError(Diag::bug(["output type not an `OpTypePointer`".into()]))
+                    })?;
             match self.lowerer.layout_of(var_data_type)? {
                 TypeLayout::Concrete(concrete) if concrete.mem_layout.dyn_unit_stride.is_none() => {
                     (
@@ -456,6 +461,10 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                 _ => return Ok(Transformed::Unchanged),
             }
         } else if spv_inst.opcode == wk.OpLoad {
+            // FIXME(eddyb) expand into per-leaf accesses.
+            if disaggregated_output_or_inputs_during_lowering {
+                return Ok(Transformed::Unchanged);
+            }
             // FIXME(eddyb) support memory operands somehow.
             if !spv_inst.imms.is_empty() {
                 return Ok(Transformed::Unchanged);
@@ -463,6 +472,10 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             assert_eq!(data_inst_def.inputs.len(), 1);
             (QPtrOp::Load.into(), data_inst_def.inputs.clone())
         } else if spv_inst.opcode == wk.OpStore {
+            // FIXME(eddyb) expand into per-leaf accesses.
+            if disaggregated_output_or_inputs_during_lowering {
+                return Ok(Transformed::Unchanged);
+            }
             // FIXME(eddyb) support memory operands somehow.
             if !spv_inst.imms.is_empty() {
                 return Ok(Transformed::Unchanged);
@@ -470,6 +483,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             assert_eq!(data_inst_def.inputs.len(), 2);
             (QPtrOp::Store.into(), data_inst_def.inputs.clone())
         } else if spv_inst.opcode == wk.OpArrayLength {
+            assert!(!disaggregated_output_or_inputs_during_lowering);
             let field_idx = match spv_inst.imms[..] {
                 [spv::Imm::Short(_, field_idx)] => field_idx,
                 _ => unreachable!(),
@@ -548,6 +562,8 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         ]
         .contains(&spv_inst.opcode)
         {
+            assert!(!disaggregated_output_or_inputs_during_lowering);
+
             // FIXME(eddyb) avoid erasing the "inbounds" qualifier.
             let base_ptr = data_inst_def.inputs[0];
             let (_, base_pointee_type) = self
@@ -588,7 +604,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                         attrs: Default::default(),
                         form: cx.intern(DataInstFormDef {
                             kind,
-                            output_type: Some(self.lowerer.qptr_type()),
+                            output_types: [self.lowerer.qptr_type()].into_iter().collect(),
                         }),
                         inputs,
                     }
@@ -609,17 +625,24 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                     _ => unreachable!(),
                 }
 
-                ptr = Value::DataInstOutput(step_data_inst);
+                ptr = Value::DataInstOutput {
+                    inst: step_data_inst,
+                    output_idx: 0,
+                };
             }
             final_step.into_data_inst_kind_and_inputs(ptr)
         } else if spv_inst.opcode == wk.OpBitcast {
+            assert!(!disaggregated_output_or_inputs_during_lowering);
+            assert_eq!(output_types.len(), 1);
+            assert_eq!(data_inst_def.inputs.len(), 1);
+
             let input = data_inst_def.inputs[0];
             // Pointer-to-pointer casts are noops on `qptr`.
             if self
                 .lowerer
                 .as_spv_ptr_type(func.at(input).type_of(cx))
                 .is_some()
-                && self.lowerer.as_spv_ptr_type(output_type.unwrap()).is_some()
+                && self.lowerer.as_spv_ptr_type(output_types[0]).is_some()
             {
                 // HACK(eddyb) noop cases should not use any `DataInst`s at all,
                 // but that would require the ability to replace all uses of a `Value`.
@@ -648,7 +671,7 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
             // intern the non-`qptr`-output `qptr.*` instructions.
             form: cx.intern(DataInstFormDef {
                 kind: new_kind,
-                output_type,
+                output_types: output_types.clone(),
             }),
             inputs: new_inputs,
         }))
@@ -668,17 +691,25 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
         // FIXME(eddyb) is this a good convention?
         let func = func_at_data_inst_frozen.at(());
 
-        match data_inst_form_def.kind {
+        let spv_inst_lowering = match &data_inst_form_def.kind {
             // Known semantics, no need to preserve SPIR-V pointer information.
             DataInstKind::FuncCall(_) | DataInstKind::QPtr(_) => return,
 
-            DataInstKind::SpvInst(_) | DataInstKind::SpvExtInst { .. } => {}
-        }
+            DataInstKind::SpvInst(_, lowering) | DataInstKind::SpvExtInst { lowering, .. } => {
+                lowering
+            }
+        };
 
         let mut old_and_new_attrs = None;
         let get_old_attrs = || AttrSetDef {
             attrs: cx[data_inst_def.attrs].attrs.clone(),
         };
+
+        if let Some(LowerError(e)) = extra_error {
+            old_and_new_attrs
+                .get_or_insert_with(get_old_attrs)
+                .push_diag(e);
+        }
 
         for (input_idx, &v) in data_inst_def.inputs.iter().enumerate() {
             if let Some((_, pointee)) = self.lowerer.as_spv_ptr_type(func.at(v).type_of(cx)) {
@@ -694,8 +725,20 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                     );
             }
         }
-        if let Some(output_type) = data_inst_form_def.output_type {
-            if let Some((addr_space, pointee)) = self.lowerer.as_spv_ptr_type(output_type) {
+        for (output_idx, &ty) in data_inst_form_def.output_types.iter().enumerate() {
+            if let Some((addr_space, pointee)) = self.lowerer.as_spv_ptr_type(ty) {
+                // FIXME(eddyb) make this impossible by lowering all instructions
+                // that may produce aggregates with pointer leaves.
+                if output_idx != 0 || spv_inst_lowering.disaggregated_output.is_some() {
+                    old_and_new_attrs
+                        .get_or_insert_with(get_old_attrs)
+                        .push_diag(Diag::bug([format!(
+                            "unsupported pointer as aggregate leaf (output #{output_idx})"
+                        )
+                        .into()]));
+                    continue;
+                }
+
                 old_and_new_attrs
                     .get_or_insert_with(get_old_attrs)
                     .attrs
@@ -707,12 +750,6 @@ impl LowerFromSpvPtrInstsInFunc<'_> {
                         .into(),
                     );
             }
-        }
-
-        if let Some(LowerError(e)) = extra_error {
-            old_and_new_attrs
-                .get_or_insert_with(get_old_attrs)
-                .push_diag(e);
         }
 
         if let Some(attrs) = old_and_new_attrs {
