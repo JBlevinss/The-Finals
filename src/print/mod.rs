@@ -977,8 +977,7 @@ impl<'a> Printer<'a> {
     }
 
     /// Pretty-print an arbitrary SPIR-V `opcode` with `imms` and `ids` as its
-    /// SPIR-V operands (with each `ID` in `ids` passed through `print_id`),
-    /// and optionally with a ` : ...` type ascription at the end (`result_type`).
+    /// SPIR-V operands (with each `ID` in `ids` passed through `print_id`).
     ///
     /// `print_id` can return `None` to indicate an ID operand is implicit in
     /// SPIR-T, and should not be printed (e.g. decorations' target IDs).
@@ -998,7 +997,6 @@ impl<'a> Printer<'a> {
         imms: &[spv::Imm],
         ids: impl IntoIterator<Item = ID>,
         print_id: impl Fn(ID, &Self) -> OPF,
-        result_type: Option<Type>,
     ) -> pretty::Fragment {
         // Split operands into "angle brackets" (immediates) and "parens" (IDs),
         // with compound operands (i.e. enumerand with ID parameter) using both,
@@ -1075,10 +1073,6 @@ impl<'a> Printer<'a> {
 
         if !paren_operands.is_empty() {
             out = pretty::Fragment::new([out, pretty::join_comma_sep("(", paren_operands, ")")]);
-        }
-
-        if let Some(ty) = result_type {
-            out = pretty::Fragment::new([out, self.pretty_type_ascription_suffix(ty)]);
         }
 
         out
@@ -1651,7 +1645,6 @@ impl Print for ExportKey {
                     imms,
                     &[ImplicitTargetId],
                     |ImplicitTargetId, _| None,
-                    None,
                 )
             }
         }
@@ -1919,7 +1912,6 @@ impl Print for Attr {
                         imms,
                         &[ImplicitTargetId],
                         |ImplicitTargetId, _| None,
-                        None,
                     ),
                 )
             }
@@ -2126,7 +2118,6 @@ impl Print for TypeDef {
                             TypeCtorArg::Type(ty) => ty.print(printer),
                             TypeCtorArg::Const(ct) => ct.print(printer),
                         },
-                        None,
                     ),
                     TypeCtor::SpvStringLiteralForExtInst => pretty::Fragment::new([
                         printer.error_style().apply("type_of").into(),
@@ -2272,14 +2263,16 @@ impl Print for ConstDef {
                 ConstCtor::PtrToGlobalVar(gv) => {
                     pretty::Fragment::new(["&".into(), gv.print(printer)])
                 }
-                ConstCtor::SpvInst(spv::Inst { opcode, ref imms }) => printer.pretty_spv_inst(
-                    printer.spv_op_style(),
-                    opcode,
-                    imms,
-                    ctor_args,
-                    Print::print,
-                    Some(*ty),
-                ),
+                ConstCtor::SpvInst(spv::Inst { opcode, ref imms }) => pretty::Fragment::new([
+                    printer.pretty_spv_inst(
+                        printer.spv_op_style(),
+                        opcode,
+                        imms,
+                        ctor_args,
+                        Print::print,
+                    ),
+                    printer.pretty_type_ascription_suffix(*ty),
+                ]),
                 ConstCtor::SpvStringLiteralForExtInst(s) => pretty::Fragment::new([
                     printer.pretty_spv_opcode(printer.spv_op_style(), wk.OpString),
                     "<".into(),
@@ -3004,14 +2997,18 @@ impl Print for DataInstDef {
             DataInstKind::SpvInst(inst) => {
                 return AttrsAndDef {
                     attrs,
-                    def_without_name: printer.pretty_spv_inst(
-                        printer.spv_op_style(),
-                        inst.opcode,
-                        &inst.imms,
-                        inputs,
-                        Print::print,
-                        *output_type,
-                    ),
+                    def_without_name: pretty::Fragment::new([
+                        printer.pretty_spv_inst(
+                            printer.spv_op_style(),
+                            inst.opcode,
+                            &inst.imms,
+                            inputs,
+                            Print::print,
+                        ),
+                        output_type
+                            .map(|ty| printer.pretty_type_ascription_suffix(ty))
+                            .unwrap_or_default(),
+                    ]),
                 };
             }
             &DataInstKind::SpvExtInst { ext_set, inst } => {
@@ -3107,7 +3104,7 @@ impl Print for cfg::ControlInst {
             })) => {
                 // FIXME(eddyb) use `targets.is_empty()` when that is stabilized.
                 assert!(targets.len() == 0);
-                printer.pretty_spv_inst(kw_style, *opcode, imms, inputs, Print::print, None)
+                printer.pretty_spv_inst(kw_style, *opcode, imms, inputs, Print::print)
             }
 
             cfg::ControlInstKind::Branch => {
@@ -3167,7 +3164,6 @@ impl SelectionKind {
                         Ok(v) => Some(v.print(printer)),
                         Err(TargetLabelId) => None,
                     },
-                    None,
                 );
 
                 pretty::Fragment::new([
