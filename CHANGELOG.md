@@ -34,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased] - ReleaseDate
 
 ### Changed 🛠
+- [PR#36](https://github.com/EmbarkStudios/spirt/pull/36) started using `OpName`s
+  in pretty-printing, to replace the `T1`/`F2`/`v3` "anonymous" style, when unambiguous
 - [PR#39](https://github.com/EmbarkStudios/spirt/pull/39) shortened pretty-printed names
   like `type2`/`func3`/etc. to `T2`/`F3`/etc. (with e.g. `type T2 = ...` style definitions)
 - [PR#38](https://github.com/EmbarkStudios/spirt/pull/38) split off `print::Node::Root`,
